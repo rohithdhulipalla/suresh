@@ -1,0 +1,870 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Shapes;
+using System.Xml.Linq;
+using UDS_Layer;
+using Interface_Layer;
+using System.Threading;
+using System.Windows.Input;
+using System.Windows.Threading;
+
+namespace HMI_FLASHER
+{
+    public partial class MainWindow : Window
+    {
+        // Fields
+        private double _percentageValue = 0;
+
+        private List<byte> Request_Arr = new List<byte>();
+        private List<byte> Response_Arr = new List<byte>(new byte[100]);
+        private ushort Timeout = 50;
+        private long length = 0;
+        private Connection ss = new Connection();
+        private bool old_device = false;
+        private bool new_device = false;
+        private bool flash_failed = false;
+        private bool disconnections_check = false;
+        private bool connections_check = false;
+
+        private XmlExtractor dd = new XmlExtractor();
+        private ObservableCollection<DataBlock> dataBlocks = new ObservableCollection<DataBlock>();
+        private CanValue canValue = new CanValue();
+        private XElement communicationElement;
+        private DispatcherTimer dotTimer;
+        private int dotCount = 0;
+        private string currentStepName = "";
+
+        // StepDefinition is used by the array approach
+        public class StepDefinition
+        {
+            public int StepIndex { get; set; }
+            public Func<Task<bool>> WorkFunc { get; set; }
+        }
+
+        public MainWindow()
+        {
+            InitializeComponent();
+            StartShiningArc();
+
+        }
+        private void OnCanDisconnected(object sender, EventArgs e)
+        {
+            // Handle CAN disconnection during processing
+            MessageBox.Show("CAN connection lost during programming. The process has failed.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+
+            // Set all further steps as failed
+            MarkRemainingStepsFailed(2, 3); // If disconnection happens during step 2, mark steps 3 as failed
+            CompleteStep(2, false); // Mark current step as failed
+        }
+
+        private async void Window_Loaded(object sender, RoutedEventArgs e)
+        {
+            // If you want to auto-run on load, uncomment:
+            // ResetAllStepsUI();
+            // await RunAllStepsAsync();
+        }
+
+        private async void FlashButton_Click(object sender, RoutedEventArgs e)
+        {
+            // Reset the step visuals
+            ResetAllStepsUI();
+
+            // Then start from the beginning
+            await RunAllStepsAsync();
+        }
+        private void StartStatusDotAnimation(string stepName)
+        {
+            currentStepName = stepName;
+            dotCount = 0;
+
+            if (dotTimer != null)
+            {
+                dotTimer.Stop();
+            }
+
+            dotTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(500)
+            };
+
+            dotTimer.Tick += (s, e) =>
+            {
+                dotCount = (dotCount + 1) % 4; // cycles 0 to 3
+                string dots = new string('.', dotCount);
+                StepStatusText.Text = $"{currentStepName}{dots}";
+            };
+
+            dotTimer.Start();
+        }
+
+        private void AnimateStepStatusText(string newText)
+        {
+            // Slide-out animation
+            var slideUp = new ThicknessAnimation
+            {
+                From = new Thickness(0, 120, 0, 0),
+                To = new Thickness(0, 80, 0, 0),
+                Duration = TimeSpan.FromMilliseconds(300),
+                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseIn }
+            };
+
+            var fadeOut = new DoubleAnimation
+            {
+                From = 1,
+                To = 0,
+                Duration = TimeSpan.FromMilliseconds(200)
+            };
+
+            var fadeIn = new DoubleAnimation
+            {
+                From = 0,
+                To = 1,
+                Duration = TimeSpan.FromMilliseconds(200),
+                BeginTime = TimeSpan.FromMilliseconds(300)
+            };
+
+            var slideIn = new ThicknessAnimation
+            {
+                From = new Thickness(0, 160, 0, 0),
+                To = new Thickness(0, 120, 0, 0),
+                Duration = TimeSpan.FromMilliseconds(300),
+                BeginTime = TimeSpan.FromMilliseconds(300),
+                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut }
+            };
+
+            // Apply animations
+            StepStatusText.BeginAnimation(TextBlock.MarginProperty, slideUp);
+            StepStatusText.BeginAnimation(TextBlock.OpacityProperty, fadeOut);
+
+            // Delay text update and animate it back in
+            DispatcherTimer delay = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(300) };
+            delay.Tick += (s, e) =>
+            {
+                delay.Stop();
+                StepStatusText.Text = newText;
+                StepStatusText.BeginAnimation(TextBlock.MarginProperty, slideIn);
+                StepStatusText.BeginAnimation(TextBlock.OpacityProperty, fadeIn);
+            };
+            delay.Start();
+        }
+
+
+        // ----------- 1) Your Helper Methods For Work Logic ----------- //
+
+        private async Task<bool> CAN_CONNECTION()
+        {
+            try
+            {
+                XDocument doc = XDocument.Load("hmi.sproj");
+                XElement communicationElement = doc.Element("TemplateInfo")?.Element("Communication");
+                if (communicationElement != null)
+                {
+                    canValue = new CanValue
+                    {
+                        Baudrate = communicationElement.Element("BuadRate")?.Value + " kbps",
+                        PhysicalCanId = communicationElement.Element("PhysicalCANID")?.Value,
+                        ResponseCanId = communicationElement.Element("ResponseCANID")?.Value
+                    };
+                }
+
+                bool connections_check = ss.ConnectToCANLayer(canValue);
+
+                return connections_check;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error loading hmi.sproj: {ex.Message}",
+                                "Error",
+                                MessageBoxButton.OK,
+                                MessageBoxImage.Error);
+                return false;
+            }
+        }
+
+        private async Task<bool> found_deviceAsync()
+        {
+            try
+            {
+                // (1) Check old_device
+                #region old_device
+                XDocument doc = XDocument.Load("old.sproj");
+                XElement communicationElement = doc.Element("TemplateInfo")?.Element("Communication");
+                if (communicationElement != null)
+                {
+                    canValue = new CanValue
+                    {
+                        Baudrate = communicationElement.Element("BuadRate")?.Value + " kbps",
+                        PhysicalCanId = communicationElement.Element("PhysicalCANID")?.Value,
+                        ResponseCanId = communicationElement.Element("ResponseCANID")?.Value
+                    };
+                }
+
+                bool connections_check = ss.ConnectToCANLayer(canValue);
+
+                if (connections_check)
+                {
+                    Request_Arr.Add(0x02);
+                    Request_Arr.Add(0x10);
+                    Request_Arr.Add(0x01);
+                    CAN_Driver.SendData(Request_Arr);
+
+                    while (true)
+                    {
+                        //Response_Arr[0] = 0x00;
+                        //Response_Arr[1] = 0x00;
+                        Response_Arr = CAN_Driver.Read_data(Timeout);
+                        length = (ushort)Response_Arr.Count;
+
+                        if (Response_Arr.Count == 0)
+                        {
+                            old_device = false;
+                            break;
+                        }
+                        else if (Response_Arr.Count == 3 && Response_Arr[0] == 0x7F &&
+                                 Response_Arr[1] == 0x10 && Response_Arr[2] == 0x78)
+                        {
+                            Timeout = 5000;
+                        }
+                        else if (Response_Arr.Count == 3 && Response_Arr[0] == 0x7F &&
+                                 Response_Arr[1] == 0x10 && Response_Arr[2] != 0x78)
+                        {
+                            old_device = true;
+                            return true;
+                        }
+                        else if (Response_Arr[0] != 0x50)
+                        {
+                            old_device = true;
+                            return true;
+                        }
+                        else
+                        {
+                            old_device = true;
+                            return true;
+                        }
+                    }
+                }
+                else
+                {
+                    return false;
+                }
+
+                bool disconnections_check = ss.DisConnectToCANLayer();
+                #endregion
+
+                // (2) Check new_device
+                #region new_device
+
+                doc = XDocument.Load("hmi.sproj");
+                communicationElement = doc.Element("TemplateInfo")?.Element("Communication");
+                if (communicationElement != null)
+                {
+                    canValue = new CanValue
+                    {
+                        Baudrate = communicationElement.Element("BuadRate")?.Value + " kbps",
+                        PhysicalCanId = communicationElement.Element("PhysicalCANID")?.Value,
+                        ResponseCanId = communicationElement.Element("ResponseCANID")?.Value
+                    };
+                }
+
+                connections_check = ss.ConnectToCANLayer(canValue);
+                Request_Arr.Clear();
+                Response_Arr.Clear();
+                if (connections_check)
+                {
+                    Request_Arr.Add(0x02);
+                    Request_Arr.Add(0x10);
+                    Request_Arr.Add(0x01);
+                    CAN_Driver.SendData(Request_Arr);
+
+                    while (true)
+                    {
+                        Response_Arr = CAN_Driver.Read_data(Timeout);
+                        length = (ushort)Response_Arr.Count;
+
+                        if (Response_Arr.Count == 0)
+                        {
+                            new_device = false;
+                            break;
+                        }
+                        else if (Response_Arr.Count == 3 && Response_Arr[0] == 0x7F &&
+                                 Response_Arr[1] == 0x10 && Response_Arr[2] == 0x78)
+                        {
+                            Timeout = 5000;
+                        }
+                        else if (Response_Arr.Count == 3 && Response_Arr[0] == 0x7F &&
+                                 Response_Arr[1] == 0x10 && Response_Arr[2] != 0x78)
+                        {
+                            new_device = true;
+                            return true;
+                        }
+                        else if (Response_Arr[0] != 0x50)
+                        {
+                            new_device = true;
+                            return true;
+                        }
+                        else
+                        {
+                            new_device = true;
+                            return true;
+                        }
+                    }
+                }
+                else
+                {
+                    return false;
+                }
+                disconnections_check = ss.DisConnectToCANLayer();
+
+                #endregion
+
+                return false;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        private async Task<bool> PROGRAMING_DEVICE()
+        {
+            try
+            {
+                if (new_device)
+                {
+                    XDocument doc = XDocument.Load("hmi.sproj");
+                    XElement communicationElement = doc.Element("TemplateInfo")?.Element("Communication");
+                    if (communicationElement != null)
+                    {
+                        canValue = new CanValue
+                        {
+                            Baudrate = communicationElement.Element("BuadRate")?.Value + " kbps",
+                            PhysicalCanId = communicationElement.Element("PhysicalCANID")?.Value,
+                            ResponseCanId = communicationElement.Element("ResponseCANID")?.Value
+                        };
+                    }
+
+                    // Now call the new async method
+                    bool result = await UDSServicesAsync(dataBlocks, canValue, "hmi.sproj");
+                    return result;
+                }
+                else
+                {
+                    XDocument doc = XDocument.Load("old.sproj");
+                    XElement communicationElement = doc.Element("TemplateInfo")?.Element("Communication");
+                    if (communicationElement != null)
+                    {
+                        canValue = new CanValue
+                        {
+                            Baudrate = communicationElement.Element("BuadRate")?.Value + " kbps",
+                            PhysicalCanId = communicationElement.Element("PhysicalCANID")?.Value,
+                            ResponseCanId = communicationElement.Element("ResponseCANID")?.Value
+                        };
+                    }
+
+                    bool result = await UDSServicesAsync(dataBlocks, canValue, "old.sproj");
+                    return result;
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error loading hmi.sproj: {ex.Message}",
+                                "Error",
+                                MessageBoxButton.OK,
+                                MessageBoxImage.Error);
+                return false;
+            }
+        }
+
+        // Wrapper for your existing synchronous UDSServices
+        public async Task<bool> UDSServicesAsync(ObservableCollection<DataBlock> dataBlocks,
+                                                 CanValue canValue,
+                                                 string sprojPath)
+        {
+            // Offload the existing synchronous logic to a background thread
+            return await Task.Run(() =>
+            {
+                return dd.UDSServices(dataBlocks, canValue, sprojPath);
+            });
+        }
+
+        // Mark multiple steps as fail
+        private void MarkRemainingStepsFailed(int start, int end)
+        {
+            for (int s = start; s <= end; s++)
+            {
+                CompleteStep(s, false);
+            }
+        }
+
+        // ----------- 2) The Single “RunAllStepsAsync” with an Array of Steps ----------- //
+
+
+        private async Task RunAllStepsAsync()
+        {
+            var steps = new[]
+            {
+   new StepDefinition
+ {
+ StepIndex = 0,
+ WorkFunc = async () =>
+ {
+
+ bool result = await CAN_CONNECTION();
+
+ if(result)// optionally disconnect
+ {
+ result = ss.DisConnectToCANLayer();
+ if(result)
+ {
+ return true;
+ }
+ else
+ {
+ return false;
+ }
+ }
+ else
+ {
+ result = ss.DisConnectToCANLayer();
+ if(result)
+ {
+ return false;
+ }
+ else
+ {
+ return false;
+ }
+ }
+
+ }
+   },
+
+ new StepDefinition
+ {
+ StepIndex = 1,
+ WorkFunc = async () =>
+ {
+ bool result = await found_deviceAsync();
+
+ if(result)// optionally disconnect
+ {
+ result = ss.DisConnectToCANLayer();
+ if(result)
+ {
+ return true;
+ }
+ else
+ {
+ return false;
+ }
+ }
+ else
+ {
+ //result = ss.DisConnectToCANLayer();
+ //if(result)
+ //{
+ // return false;
+ //}
+ //else
+ {
+ return false;
+ }
+ }
+
+ }
+ },
+        new StepDefinition
+        {
+            StepIndex = 2,
+            WorkFunc = async () =>
+            {
+                bool result = await PROGRAMING_DEVICE();
+
+                ss.DisConnectToCANLayer(); // Even on failure
+             
+
+                return result;
+            }
+        },
+        new StepDefinition
+        {
+            StepIndex = 3,
+            WorkFunc = async () =>
+            {
+                await Task.Delay(1000);
+                return true;
+            }
+        }
+    };
+
+            for (int i = 0; i < steps.Length; i++)
+            {
+                var step = steps[i];
+
+                SetStepInProgress(step.StepIndex);
+
+                for (int inc = 0; inc < 5; inc++)
+                {
+                    UpdateCircularProgress(_percentageValue + 1);
+                    await Task.Delay(100);
+                }
+
+                bool success;
+                try
+                {
+                    success = await step.WorkFunc();
+                }
+                catch
+                {
+                    success = false;
+                }
+
+                CompleteStep(step.StepIndex, success);
+
+                if (!success)
+                {
+                    MarkRemainingStepsFailed(i + 1, steps.Length - 1);
+                    break;
+                }
+
+                double milestone = ((step.StepIndex + 1) * 25);
+                UpdateCircularProgress(milestone);
+            }
+        }
+
+        // ----------- 3) UI/Animation Helpers ----------- //
+
+        private void ResetAllStepsUI()
+        {
+            // Reset step visuals 0..3
+            ResetStep(0, "1", "CAN_CONNECTION");
+            ResetStep(1, "2", "DEVICE_FOUND");
+            ResetStep(2, "3", "PROGRAMMING");
+            ResetStep(3, "4", "VERIFYING");
+
+            // Reset connecting line segments
+            ProgressSegment0.Width = 0;
+            ProgressSegment1.Width = 0;
+            ProgressSegment2.Width = 0;
+
+            // Reset the circular progress
+            _percentageValue = 0;
+            PercentageText.Text = "0%";
+            ProgressSegment.Point = new Point(100, 15);
+            ProgressSegment.IsLargeArc = false;
+        }
+
+        private void ResetStep(int stepIndex, string iconText, string labelText)
+        {
+            Ellipse ellipse = (Ellipse)FindName($"Step{stepIndex}Ellipse");
+            TextBlock icon = (TextBlock)FindName($"Step{stepIndex}Icon");
+            TextBlock text = (TextBlock)FindName($"Step{stepIndex}Text");
+
+            if (ellipse != null)
+            {
+                ellipse.Fill = Brushes.White;
+                ellipse.Stroke = Brushes.Gray;
+                ellipse.StrokeThickness = 2;
+            }
+
+            if (icon != null)
+            {
+                icon.Text = iconText;
+                icon.Foreground = Brushes.Gray;
+                icon.RenderTransform = null;
+                icon.Tag = null;
+            }
+
+            if (text != null)
+            {
+                text.Text = labelText;
+                text.Foreground = Brushes.Gray;
+            }
+        }
+
+        private void CompleteStep(int stepIndex, bool success)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                var ellipse = (Ellipse)FindName($"Step{stepIndex}Ellipse");
+                var icon = (TextBlock)FindName($"Step{stepIndex}Icon");
+                var text = (TextBlock)FindName($"Step{stepIndex}Text");
+
+                // Step label
+                string[] stepLabels = { "CAN_CONNECTION", "DEVICE_FOUND", "PROGRAMMING", "VERIFYING" };
+
+                // Start dot animation
+                if (stepIndex >= 0 && stepIndex < stepLabels.Length)
+                {
+                    StartStatusDotAnimation(stepLabels[stepIndex]);
+                }
+
+                // Stop rotating if present
+                if (icon?.Tag is RotateTransform rotateTransform)
+                {
+                    rotateTransform.BeginAnimation(RotateTransform.AngleProperty, null);
+                    icon.RenderTransform = null;
+                    icon.Tag = null;
+                }
+
+                if (ellipse != null && icon != null && text != null)
+                {
+                    if (success)
+                    {
+                        var ellipseGradient = new LinearGradientBrush
+                        {
+                            StartPoint = new Point(0, 0),
+                            EndPoint = new Point(1, 1)
+                        };
+                        ellipseGradient.GradientStops.Add(new GradientStop((Color)ColorConverter.ConvertFromString("#FFFA709A"), 0.0));
+                        ellipseGradient.GradientStops.Add(new GradientStop((Color)ColorConverter.ConvertFromString("#FF784BA0"), 0.5));
+                        ellipseGradient.GradientStops.Add(new GradientStop((Color)ColorConverter.ConvertFromString("#FF2B86C5"), 1.0));
+
+                        ellipse.Fill = ellipseGradient;
+                        ellipse.Stroke = Brushes.Transparent;
+
+                        icon.Text = "✔";
+                        icon.Foreground = Brushes.White;
+                        text.Foreground = ellipseGradient;
+                    }
+                    else
+                    {
+                        ellipse.Fill = Brushes.Red;
+                        ellipse.Stroke = Brushes.Transparent;
+
+                        icon.Text = "✖";
+                        icon.Foreground = Brushes.White;
+                        text.Foreground = Brushes.Red;
+                    }
+                }
+
+                dotTimer?.Stop();
+
+                if (stepIndex >= 0 && stepIndex < stepLabels.Length)
+                {
+                    AnimateStepStatusText(stepLabels[stepIndex]);
+                }
+
+                AnimateProgressLine(stepIndex, success);
+
+                // ✅ Show final "COMPLETED" after last successful step
+                if (stepIndex == stepLabels.Length - 1 && success)
+                {
+                    AnimateStepStatusText("COMPLETED");
+                }
+            });
+        }
+
+        private void SetStepInProgress(int stepIndex)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                var ellipse = (Ellipse)FindName($"Step{stepIndex}Ellipse");
+                var icon = (TextBlock)FindName($"Step{stepIndex}Icon");
+                var text = (TextBlock)FindName($"Step{stepIndex}Text");
+
+                string[] stepLabels = { "CAN_CONNECTION", "DEVICE_FOUND", "PROGRAMMING", "VERIFYING" };
+
+                if (ellipse != null && icon != null && text != null)
+                {
+                    ellipse.Fill = Brushes.White;
+                    ellipse.Stroke = Brushes.Gray;
+                    icon.Text = "⏳";
+                    icon.Foreground = Brushes.Orange;
+                    text.Foreground = Brushes.Orange;
+
+                    // Start dot animation for step label
+                    if (stepIndex >= 0 && stepIndex < stepLabels.Length)
+                    {
+                        StartStatusDotAnimation(stepLabels[stepIndex]);
+                    }
+
+                    // Start rotation animation
+                    var rotateTransform = new RotateTransform();
+                    icon.RenderTransform = rotateTransform;
+                    icon.RenderTransformOrigin = new Point(0.5, 0.5);
+
+                    var rotateAnimation = new DoubleAnimation
+                    {
+                        From = 0,
+                        To = 360,
+                        Duration = TimeSpan.FromSeconds(1),
+                        RepeatBehavior = RepeatBehavior.Forever
+                    };
+                    rotateTransform.BeginAnimation(RotateTransform.AngleProperty, rotateAnimation);
+
+                    icon.Tag = rotateTransform;
+                }
+            });
+        }
+
+        private void AnimateProgressLine(int stepIndex, bool success)
+        {
+            if (stepIndex == 0) return;
+
+            var segment = (Rectangle)FindName($"ProgressSegment{stepIndex - 1}");
+
+            if (segment != null)
+            {
+                if (success)
+                {
+                    // Violet-pink-blue gradient for success
+                    LinearGradientBrush gradientBrush = new LinearGradientBrush
+                    {
+                        StartPoint = new Point(0, 0),
+                        EndPoint = new Point(1, 0)
+                    };
+                    gradientBrush.GradientStops.Add(new GradientStop((Color)ColorConverter.ConvertFromString("#FFFA709A"), 0.0));
+                    gradientBrush.GradientStops.Add(new GradientStop((Color)ColorConverter.ConvertFromString("#FF784BA0"), 0.5));
+                    gradientBrush.GradientStops.Add(new GradientStop((Color)ColorConverter.ConvertFromString("#FF2B86C5"), 1.0));
+                    segment.Fill = gradientBrush;
+                }
+                else
+                {
+                    // Solid red for failure
+                    segment.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FFDC3545")); // Bootstrap Red
+                }
+
+                // Animate the width of the segment for a smooth transition
+                DoubleAnimation anim = new DoubleAnimation
+                {
+                    To = 145,
+                    Duration = TimeSpan.FromMilliseconds(500)
+                };
+
+                segment.BeginAnimation(Rectangle.WidthProperty, anim);
+            }
+        }
+        private void UpdateCircularProgress(double newValue)
+        {
+            // clamp 0..100
+            if (newValue < 0) newValue = 0;
+            if (newValue > 100) newValue = 100;
+
+            _percentageValue = newValue;
+            PercentageText.Text = $"{(int)_percentageValue}%";
+
+            double angle = (_percentageValue / 100.0) * 360.0;
+            // Avoid 360 to ensure we actually get a visible arc
+            if (angle >= 360.0)
+                angle = 359.9999;
+
+            bool isLargeArc = (angle > 180);
+            double radians = angle * (Math.PI / 180.0);
+
+            double centerX = 100;
+            double centerY = 100;
+            double radius = 85;
+
+            double endX = centerX + radius * Math.Sin(radians);
+            double endY = centerY - radius * Math.Cos(radians);
+
+            // Set your ArcSegment
+            ProgressSegment.Point = new Point(endX, endY);
+            ProgressSegment.IsLargeArc = isLargeArc;
+        }
+        private void MinimizeButton_Click(object sender, RoutedEventArgs e)
+        {
+            this.WindowState = WindowState.Minimized;
+        }
+        private void OptionsButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is Button btn && btn.ContextMenu != null)
+            {
+                btn.ContextMenu.PlacementTarget = btn;
+                btn.ContextMenu.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
+                btn.ContextMenu.IsOpen = true;
+            }
+        }
+
+        private bool isDarkTheme = false;
+
+        private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (e.ChangedButton == MouseButton.Left)
+                this.DragMove();
+        }
+
+
+        private void CloseButton_Click(object sender, RoutedEventArgs e)
+        {
+            Close();
+        }
+
+
+
+        private void ThemeToggleButton_Click(object sender, RoutedEventArgs e)
+        {
+            isDarkTheme = !isDarkTheme;
+
+            if (isDarkTheme)
+            {
+                MainGrid.Background = Brushes.Black;
+                ThemeIcon.Text = "🔆";
+
+                // Toggle only if they are currently black
+                if (((SolidColorBrush)PercentageText.Foreground).Color == Colors.Black)
+                    PercentageText.Foreground = Brushes.White;
+
+                if (((SolidColorBrush)StepStatusText.Foreground).Color == Colors.Black)
+                    StepStatusText.Foreground = Brushes.White;
+            }
+            else
+            {
+                MainGrid.Background = Brushes.Ivory;
+                ThemeIcon.Text = "🌙";
+
+                // Toggle only if they are currently white
+                if (((SolidColorBrush)PercentageText.Foreground).Color == Colors.White)
+                    PercentageText.Foreground = Brushes.Black;
+
+                if (((SolidColorBrush)StepStatusText.Foreground).Color == Colors.White)
+                    StepStatusText.Foreground = Brushes.Black;
+            }
+        }
+
+        private void StartShiningArc()
+        {
+            var brush = ShineBrush;
+
+            var animation1 = new DoubleAnimation
+            {
+                From = 0.0,
+                To = 1.0,
+                Duration = TimeSpan.FromSeconds(0.5),
+                RepeatBehavior = RepeatBehavior.Forever,
+                AutoReverse = true
+            };
+
+            var animation2 = new DoubleAnimation
+            {
+                From = 0.5,
+                To = 1.5,
+                Duration = TimeSpan.FromSeconds(0.5),
+                RepeatBehavior = RepeatBehavior.Forever,
+                AutoReverse = true
+            };
+
+            var animation3 = new DoubleAnimation
+            {
+                From = 1.0,
+                To = 2.0,
+                Duration = TimeSpan.FromSeconds(0.5),
+                RepeatBehavior = RepeatBehavior.Forever,
+                AutoReverse = true
+            };
+
+            brush.GradientStops[0].BeginAnimation(GradientStop.OffsetProperty, animation1);
+            brush.GradientStops[1].BeginAnimation(GradientStop.OffsetProperty, animation2);
+            brush.GradientStops[2].BeginAnimation(GradientStop.OffsetProperty, animation3);
+        }
+
+
+    }
+}
